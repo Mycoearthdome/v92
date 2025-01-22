@@ -5,7 +5,8 @@ use std::fs::File;
 use std::path::Path;
 use std::error::Error;
 use std::thread;
-
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Pull in zmodem2's symbols
 use zmodem2::{
@@ -31,7 +32,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("  quit             - exit program");
     println!();
 
-    let mut maybe_port: Option<Box<dyn SerialPort>> = None;
+    let mut maybe_port: Option<Arc<Mutex<Box<dyn SerialPort + Send>>>> = None;
     let stdin = io::stdin();
 
     loop {
@@ -56,7 +57,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     match open_modem_port(port_path, 115_200) {
                         Ok(port) => {
                             println!("Opened serial port: {}", port_path);
-                            maybe_port = Some(port);
+                            maybe_port = Some(Arc::new(Mutex::new(port)));
                         }
                         Err(e) => eprintln!("Failed to open port: {}", e),
                     }
@@ -68,7 +69,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "init" => {
                 // Initialize the modem in V.92 mode
                 if let Some(ref mut port) = maybe_port {
-                    if let Err(e) = init_modem(&mut **port) {
+                    if let Err(e) = init_modem(Arc::clone(port)) {
                         eprintln!("Modem init error: {}", e);
                     } else {
                         println!("Modem initialized.");
@@ -81,8 +82,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             "dial" => {
                 // Dial a phone number
                 if let Some(phone_number) = parts.next() {
-                    if let Some(ref mut port) = maybe_port {
-                        let _ = dial_number(&mut **port, phone_number);
+                    if let Some(port) = maybe_port.clone() {
+                        let _ = dial_number(port, phone_number); // Pass the Box directly
                         println!("Dialing {}...", phone_number);
                     } else {
                         eprintln!("No serial port is open. Use 'setport' first.");
@@ -90,12 +91,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 } else {
                     eprintln!("Usage: dial <phone_number>");
                 }
-            }
+}
 
             "answer" => {
                 // Answer an incoming call
-                if let Some(ref mut port) = maybe_port {
-                    let _ = answer_call(&mut **port);
+                if let Some(port) = maybe_port.clone() {
+                    let _ = answer_call(port);
                     println!("Answering...");
                 } else {
                     eprintln!("No serial port is open. Use 'setport' first.");
@@ -129,34 +130,50 @@ fn open_modem_port(port_name: &str, baud_rate: u32) -> Result<Box<dyn SerialPort
 }
 
 /// Send typical AT commands to reset the modem and ensure V.92 is enabled.
-fn init_modem(port: &mut dyn SerialPort) -> Result<(), Box<dyn Error>> {
-    port.write_all(b"ATZ\r")?;
+fn init_modem(port: Arc<Mutex<Box<dyn SerialPort + Send>>>) -> Result<(), Box<dyn Error>> {
+    let mut port_guard = port.lock().unwrap(); // Lock the port once for the function
+
+    // Send the ATZ command to reset the modem
+    std::io::Write::write_all(&mut *port_guard, b"ATZ\r")?;
+    port_guard.flush()?; // Flush to ensure data is sent
     std::thread::sleep(Duration::from_millis(500));
 
-    port.write_all(b"AT&F1\r")?;
+    // Send the AT&F1 command to load factory settings
+    std::io::Write::write_all(&mut *port_guard,b"AT&F1\r")?;
+    port_guard.flush()?;
     std::thread::sleep(Duration::from_millis(500));
 
-    port.write_all(b"AT+MS=V92,1,300,56000,300,48000\r")?;
+    // Send the AT+MS command to configure V.92 settings
+    std::io::Write::write_all(&mut *port_guard,b"AT+MS=V92,1,300,56000,300,48000\r")?;
+    port_guard.flush()?;
     std::thread::sleep(Duration::from_millis(500));
 
     // Read and display the modem response (optional)
     let mut buf = [0u8; 1024];
-    if let Ok(n) = port.read(&mut buf) {
-        let resp = String::from_utf8_lossy(&buf[..n]);
-        println!("Modem response:\n{}", resp);
+    match std::io::Read::read(&mut *port_guard, &mut buf) {
+        Ok(n) if n > 0 => {
+            let resp = String::from_utf8_lossy(&buf[..n]);
+            println!("Modem response:\n{}", resp);
+        }
+        Ok(_) => println!("No response from modem."),
+        Err(e) => eprintln!("Error reading modem response: {}", e),
     }
+
     Ok(())
 }
 
+
 /// Dials a phone number, waits for "CONNECT",
 /// parses the speed, then calls `chat_loop`.
-fn dial_number(port: &mut dyn SerialPort, phone_number: &str) -> Result<(), Box<dyn Error>> {
+fn dial_number(port: Arc<Mutex<Box<dyn SerialPort + Send>>>, phone_number: &str) -> Result<(), Box<dyn Error>> {
+    let mut port_guard = port.lock().unwrap(); // Lock the port once for the function
+
     // 1) Send dial command
     let cmd = format!("ATD{}\r", phone_number);
-    port.write_all(cmd.as_bytes())?;
+    std::io::Write::write_all(&mut *port_guard, cmd.as_bytes())?;
 
-    // 2) Wrap the port in a BufReader (clone it)
-    let mut reader = BufReader::new(port.try_clone()?);
+    let mut reader = BufReader::new(port_guard.try_clone()?);
+    
     let mut response_line = String::new();
 
     loop {
@@ -186,15 +203,18 @@ fn dial_number(port: &mut dyn SerialPort, phone_number: &str) -> Result<(), Box<
                         }
                     }
                     println!("Entered CHAT mode!");
+                    println!("/send filename");
+                    println!("/receive");
+                    println!("/quit");
                     // Now jump into chat mode
-                    chat_loop(port);
+                    chat_loop(Arc::clone(&port));
                     break; // exit function
                 }
 
                 // You might also handle "BUSY", "NO CARRIER", etc. here.
             }
-            Err(e) => {
-                eprintln!("Error reading line: {}", e);
+            Err(_e) => {
+                eprintln!("Please Wait... ");
                 thread::sleep(Duration::from_millis(100));
             }
         }
@@ -203,14 +223,13 @@ fn dial_number(port: &mut dyn SerialPort, phone_number: &str) -> Result<(), Box<
     Ok(())
 }
 
-/// Enables auto-answer (S0=1), waits for "CONNECT",
-/// parses speed, then calls `chat_loop`.
-fn answer_call(port: &mut dyn SerialPort) -> Result<(), Box<dyn Error>> {
-    // 1) Tell modem to auto-answer on first ring
-    port.write_all(b"ATS0=1\r")?;
+fn answer_call(port: Arc<Mutex<Box<dyn SerialPort + Send>>>) -> Result<(), Box<dyn Error>> {
+    let mut port_guard = port.lock().unwrap(); // Lock the port once for the function
+    // 1) Tell modem to auto-answer on the first ring
+    let _ = std::io::Write::write_all(&mut *port_guard, b"ATS0=1\r");
+    port_guard.flush()?;
 
-    // 2) Create a BufReader
-    let mut reader = BufReader::new(port.try_clone()?);
+    let mut reader = BufReader::new(port_guard.try_clone()?);
     let mut line = String::new();
 
     loop {
@@ -225,22 +244,16 @@ fn answer_call(port: &mut dyn SerialPort) -> Result<(), Box<dyn Error>> {
                 eprintln!("Modem says: {}", trimmed);
 
                 if trimmed.starts_with("CONNECT") {
-                    let mut parts = trimmed.split_whitespace();
-                    parts.next(); // skip "CONNECT"
-                    if let Some(speed_str) = parts.next() {
-                        if let Ok(speed) = speed_str.parse::<u32>() {
-                            eprintln!("Incoming call connected at speed: {} bps", speed);
-                        } else {
-                            eprintln!("Incoming call connected. Could not parse speed: {}", speed_str);
-                        }
-                    }
                     println!("Entered CHAT mode!");
-                    chat_loop(port);
+                    println!("/send filename");
+                    println!("/receive");
+                    println!("/quit");
+                    chat_loop(Arc::clone(&port));
                     break;
                 }
             }
-            Err(e) => {
-                eprintln!("Error reading line: {}", e);
+            Err(_e) => {
+                eprintln!("Please Wait... ");
                 thread::sleep(Duration::from_millis(100));
             }
         }
@@ -249,74 +262,141 @@ fn answer_call(port: &mut dyn SerialPort) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// The main chat loop.  
-/// - Reads lines from stdin  
-/// - Sends them to the modem.  
-/// - Displays any received modem data.  
-/// - Special commands for ZMODEM2: `/zsend <path>` or `/zrecv`
-fn chat_loop(port: &mut dyn SerialPort) {
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    let mut modem_buf = Vec::new();
-    let mut input_line = String::new();
+fn chat_loop(port: Arc<Mutex<Box<dyn SerialPort + Send>>>) {
+    let modem_buf = Arc::new(Mutex::new(Vec::new()));
+    let stdout = Arc::new(Mutex::new(io::BufWriter::new(io::stdout())));
+    let running = Arc::new(AtomicBool::new(true));
 
-    loop {
-        // 1) Attempt to read from the modem (non-blocking).
-        let mut read_buf = [0u8; 256];
+    // Thread for reading from modem
+    let reader_handle = {
+        let port_clone = Arc::clone(&port);
+        let modem_buf_clone = Arc::clone(&modem_buf);
+        let stdout_clone = Arc::clone(&stdout);
+        let running_clone = Arc::clone(&running);
 
-        match StdRead::read(&mut *port, &mut read_buf) {
-            Ok(bytes_read) if bytes_read > 0 => {
-                modem_buf.extend_from_slice(&read_buf[..bytes_read]);
-                // Split on newline for display
-                while let Some(pos) = modem_buf.iter().position(|&b| b == b'\n') {
-                    let line_bytes = modem_buf.drain(..=pos).collect::<Vec<_>>();
-                    let line_str = String::from_utf8_lossy(&line_bytes);
-                    print!("(modem) {}", line_str);
-                    stdout.flush().ok();
-                }
-            }
-            _ => {
-                // No data. We can briefly sleep or skip to avoid 100% CPU usage.
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
-
-        // 2) Check if user typed something
-        if let Ok(n) = stdin.lock().read_line(&mut input_line) {
-            if n > 0 {
-                let trimmed = input_line.trim().to_string();
-                input_line.clear(); // For next line
-
-                if trimmed.starts_with("/send ") {
-                    // /zsend <path>
-                    if let Some(path) = trimmed.strip_prefix("/zsend ").map(str::trim) {
-                        if !path.is_empty() {
-                            if let Err(e) = zmodem2_send(&mut *port, path) {
-                                eprintln!("ZMODEM2 send error: {}", e);
-                            }
-                        } else {
-                            println!("Usage: /send <file_path>");
+        thread::spawn(move || {
+            let mut read_buf = [0u8; 256];
+            while running_clone.load(Ordering::SeqCst) {
+                let bytes_read = {
+                    let mut port = match port_clone.lock() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("Failed to lock port: {}", e);
+                            break;
+                        }
+                    };
+                    match std::io::Read::read(&mut **port, &mut read_buf) {
+                        Ok(n) => n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => {
+                            eprintln!("Error reading from modem: {}", e);
+                            break;
                         }
                     }
-                } else if trimmed == "/receive" {
-                    // /zrecv
-                    if let Err(e) = zmodem2_recv(&mut *port, ".") {
-                        eprintln!("ZMODEM2 receive error: {}", e);
+                };
+
+                if bytes_read > 0 {
+                    let mut modem_buf = modem_buf_clone.lock().unwrap();
+                    modem_buf.extend_from_slice(&read_buf[..bytes_read]);
+
+                    const MAX_BUFFER_SIZE: usize = 4096;
+                    if modem_buf.len() > MAX_BUFFER_SIZE {
+                        modem_buf.clear();
+                        eprintln!("Buffer overflow. Clearing buffer.");
                     }
-                } else if trimmed == "/quit" {
-                    // Exit chat
-                    println!("Leaving chat mode...");
-                    break;
+
+                    while let Some(pos) = modem_buf.iter().position(|&b| b == b'\n') {
+                        let line_bytes = modem_buf.drain(..=pos).collect::<Vec<_>>();
+                        let line_cow = String::from_utf8_lossy(&line_bytes);
+                        if line_cow.contains('\u{FFFD}') {
+                            eprintln!("Warning: Received invalid UTF-8 data.");
+                        }
+                        let line_str = line_cow.trim_end();
+
+                        let mut stdout = stdout_clone.lock().unwrap();
+                        if writeln!(stdout, "(modem) {}", line_str).is_err() {
+                            eprintln!("Error writing to stdout");
+                        }
+                        if stdout.flush().is_err() {
+                            eprintln!("Error flushing stdout");
+                        }
+                    }
                 } else {
-                    // Normal chat message
-                    let _ = std::io::Write::write_all(&mut *port, trimmed.as_bytes());
-                    let _ = std::io::Write::write_all(&mut *port, b"\r\n");
+                    thread::sleep(Duration::from_millis(50));
                 }
             }
-        }
-    }
+        })
+    };
+
+    // Thread for handling user input
+    let writer_handle = {
+        let port_clone = Arc::clone(&port);
+        let running_clone = Arc::clone(&running);
+    
+        thread::spawn(move || {
+            let stdin = io::stdin();
+
+            while running_clone.load(Ordering::SeqCst) {
+                let stdin_lock = stdin.lock();
+                for line in stdin_lock.lines() {
+                    match line {
+                        Ok(input_line) => {
+                            let trimmed = input_line.trim();
+                            if trimmed.starts_with("/send ") {
+                                if let Some(path) = trimmed.strip_prefix("/send ").map(str::trim) {
+                                    if !path.is_empty() {
+                                        if let Err(e) = zmodem2_send(Arc::clone(&port_clone), path) {
+                                            eprintln!("ZMODEM2 send error: {}", e);
+                                        }
+                                    } else {
+                                        println!("Usage: /send <file_path>");
+                                    }
+                                }
+                            } else if trimmed == "/receive" {
+                                if let Err(e) = zmodem2_recv(Arc::clone(&port_clone), ".") {
+                                    eprintln!("ZMODEM2 receive error: {}", e);
+                                }
+                            } else if trimmed == "/quit" {
+                                println!("Leaving chat mode...");
+                                running_clone.store(false, Ordering::SeqCst);
+                                return; // Exit the thread immediately
+                            } else {
+                                {
+                                    let mut port = port_clone.lock().unwrap();
+                                    if let Err(e) = std::io::Write::write_all(&mut **port, trimmed.as_bytes()) {
+                                        eprintln!("Error writing to modem: {}", e);
+                                    }
+                                    if let Err(e) = std::io::Write::write_all(&mut **port, b"\r\n") {
+                                        eprintln!("Error writing newline to modem: {}", e);
+                                    }
+                                    port.flush().ok(); // Ensure data is sent immediately
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error reading from stdin: {}", e);
+                            if e.kind() == std::io::ErrorKind::Interrupted {
+                                continue; // Retry reading after interruption
+                            } else {
+                                running_clone.store(false, Ordering::SeqCst);
+                                return; // Exit on unrecoverable errors
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    };
+
+    // Wait for threads to finish
+    reader_handle.join().unwrap();
+    writer_handle.join().unwrap();
 
 }
+
+
+
+
 
 // --------------------------------------------------------------------
 // Integrating zmodem2
@@ -445,26 +525,27 @@ impl ZSeek for LocalFile {
 // --------------------------------------------------------------------
 
 /// Send a file using the zmodem2 crate in a loop until the transfer is `Done`.
-fn zmodem2_send(port: &mut dyn SerialPort, file_path: &str) -> Result<(), Box<dyn Error>> {
+fn zmodem2_send(port: Arc<Mutex<Box<dyn SerialPort + Send>>>, file_path: &str) -> Result<(), Box<dyn Error>> {
     let path = Path::new(file_path);
     if !path.exists() || !path.is_file() {
         return Err(format!("Not a valid file: {}", file_path).into());
     }
-
-
 
     let size = std::fs::metadata(path)?.len();
     let size_u32 = u32::try_from(size).unwrap_or(u32::MAX);
 
     // Open the file for reading
     let file = File::open(path)?;
-    let mut file_wrapper = LocalFile{inner:file};
+    let mut file_wrapper = LocalFile { inner: file };
 
     // Create a ZMODEM2 state with the file name and size
     let mut state = ZState::new_file(file_path, size_u32)
         .map_err(|_| "Failed to create ZMODEM2 State")?;
 
-    let mut zport = ZPort { port };
+    let mut port_guard = port.lock().unwrap();
+    let port_ref = &mut **port_guard;
+
+    let mut zport = ZPort { port: port_ref as &mut dyn SerialPort};
 
     println!("Sending '{}' ({} bytes) via ZMODEM2...", file_path, size);
 
@@ -477,7 +558,9 @@ fn zmodem2_send(port: &mut dyn SerialPort, file_path: &str) -> Result<(), Box<dy
             println!("File '{}' sent successfully!", file_path);
             break;
         }
-        // If not done, just loop again. The library uses small step calls.
+
+        // Short sleep to avoid tight looping and allow other tasks to proceed
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
     Ok(())
@@ -492,22 +575,22 @@ fn zmodem2_send(port: &mut dyn SerialPort, file_path: &str) -> Result<(), Box<dy
 /// Because we won't know the filename until the first ZFILE frame arrives,
 /// we create a `State::new()` and then open the file once we discover its name
 /// in the subpacket.
-fn zmodem2_recv(port: &mut dyn SerialPort, output_dir: &str) -> Result<(), Box<dyn Error>> {
+fn zmodem2_recv(port: Arc<Mutex<Box<dyn SerialPort + Send>>>, output_dir: &str) -> Result<(), Box<dyn Error>> {
+    let mut port_guard = port.lock().unwrap();
     let mut state = ZState::new(); // start with an empty (no-file) state
     let mut maybe_out_file: Option<LocalFile> = None;
 
-    let mut zport = ZPort { port };
-
+    let port_ref = &mut **port_guard;
+    let mut zport = ZPort { port: port_ref as &mut dyn SerialPort};
 
     println!("Awaiting inbound ZMODEM2 file transfer...");
 
     loop {
-
         if maybe_out_file.is_none() && !state.file_name().is_empty() {
             let out_path = Path::new(output_dir).join(state.file_name());
             let f = LocalFile::create(&out_path)?; // Our wrapper that implements zmodem2::Write
             maybe_out_file = Some(f);
-        
+
             // Now that we have the file name, we can log the "size" if it's known
             let announced_size = state.file_size();
             println!(
@@ -516,23 +599,27 @@ fn zmodem2_recv(port: &mut dyn SerialPort, output_dir: &str) -> Result<(), Box<d
                 announced_size
             );
         }
-        
+
         // Step the ZMODEM receive
-        let result = zmodem_recv_step(&mut zport, maybe_out_file.as_mut().unwrap(), &mut state);
+        if let Some(ref mut out_file) = maybe_out_file {
+            let result = zmodem_recv_step(&mut zport, out_file, &mut state);
 
-        // If an error occurs, break out
-        if let Err(e) = result {
-            return Err(format!("ZMODEM2 receive error: {:?}", e).into());
+            // If an error occurs, break out
+            if let Err(e) = result {
+                return Err(format!("ZMODEM2 receive error: {:?}", e).into());
+            }
+
+            // If done, exit loop
+            if state.stage() == ZStage::Done {
+                println!("File '{}' received successfully!", state.file_name());
+                break;
+            }
+        } else {
+            // Wait briefly for ZMODEM protocol to provide more data
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
-
-        // If done, exit loop
-        if state.stage() == ZStage::Done {
-            println!("File '{}' received successfully!", state.file_name());
-            break;
-        }
-
-        // Otherwise, keep looping to handle the next step in the protocol
     }
 
     Ok(())
 }
+
