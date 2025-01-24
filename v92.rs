@@ -124,7 +124,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// Open a serial port with standard 8N1 and the given baud rate.
 fn open_modem_port(port_name: &str, baud_rate: u32) -> Result<Box<dyn SerialPort>, Box<dyn Error>> {
     let port = serialport::new(port_name, baud_rate)
-        .timeout(Duration::from_millis(500))
+        .timeout(Duration::from_millis(5000))
         .data_bits(DataBits::Eight)
         .parity(Parity::None)
         .stop_bits(StopBits::One)
@@ -377,7 +377,7 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
     // Spawn the reader thread to handle incoming data
     let reader_handle = thread::spawn(move || {
         while running_clone_reader.load(Ordering::SeqCst) {
-            match data_receiver_clone.recv_timeout(Duration::from_millis(100)) {
+            match data_receiver_clone.recv() {
                 Ok(data) => {
                     if data.contains("B00000000000000"){ // incomming file.
                         //receiving a file
@@ -395,9 +395,9 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
                         println!("(modem) {}", data.trim_end());
                     }
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                //Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     // No data received within timeout, continue
-                }
+                //}
                 Err(_) => {
                     // Channel disconnected
                     break;
@@ -617,7 +617,7 @@ pub fn zmodem2_send(port: &mut dyn SerialPort, file_path: &str) -> Result<(), Bo
             Err(e) => {
                 // If `send` fails, handle the error
                 eprintln!("Error during send: {:?}", e);
-                break; // Exit the loop or implement retry logic
+                //break; // Exit the loop or implement retry logic
             }
         }
     
@@ -664,7 +664,7 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
                     Err(e) => {
                         // If `receive` fails, handle the error
                         eprintln!("Error during receive: {:?}", e);
-                        break; // Exit the loop or implement retry logic
+                        //break; // Exit the loop or implement retry logic
                     }
                 }
             
