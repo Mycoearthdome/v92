@@ -1,10 +1,11 @@
 use serialport::{DataBits, FlowControl, Parity, SerialPort, StopBits};
+use crossbeam_channel::{unbounded, Sender, Receiver};
 use std::error::Error;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read as StdRead, Write as StdWrite};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -13,6 +14,15 @@ use zmodem2::{
     receive as zmodem_recv_step, send as zmodem_send_step, Error as ZError, Read as ZRead,
     Seek as ZSeek, Stage as ZStage, State as ZState, Write as ZWrite,
 };
+
+
+/// Enum representing commands that can be sent to the serial port handler
+enum SerialCommand {
+    Write(String),
+    SendZmodem(String),    // Path to send
+    ReceiveZmodem(String), // Destination path
+    Quit,
+}
 
 /// Main entry point: run a simple shell for V.92 + ZMODEM2.
 fn main() -> Result<(), Box<dyn Error>> {
@@ -25,7 +35,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("  quit             - exit program");
     println!();
 
-    let mut maybe_port: Option<Arc<Mutex<Box<dyn SerialPort + Send>>>> = None;
+    let mut maybe_port: Option<Box<dyn SerialPort + Send>> = None;
     let stdin = io::stdin();
 
     loop {
@@ -50,7 +60,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     match open_modem_port(port_path, 115_200) {
                         Ok(port) => {
                             println!("Opened serial port: {}", port_path);
-                            maybe_port = Some(Arc::new(Mutex::new(port)));
+                            maybe_port = Some(port);
                         }
                         Err(e) => eprintln!("Failed to open port: {}", e),
                     }
@@ -62,7 +72,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "init" => {
                 // Initialize the modem in V.92 mode
                 if let Some(ref mut port) = maybe_port {
-                    if let Err(e) = init_modem(Arc::clone(port)) {
+                    if let Err(e) = init_modem(port) {
                         eprintln!("Modem init error: {}", e);
                     } else {
                         println!("Modem initialized.");
@@ -75,7 +85,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "dial" => {
                 // Dial a phone number
                 if let Some(phone_number) = parts.next() {
-                    if let Some(port) = maybe_port.clone() {
+                    if let Some(port) = maybe_port.take() {
                         let _ = dial_number(port, phone_number); // Pass the Box directly
                         println!("Dialing {}...", phone_number);
                     } else {
@@ -88,7 +98,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             "answer" => {
                 // Answer an incoming call
-                if let Some(port) = maybe_port.clone() {
+                if let Some(port) = maybe_port.take() { // Take ownership out of maybe_port
                     let _ = answer_call(port);
                     println!("Answering...");
                 } else {
@@ -113,37 +123,40 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// Open a serial port with standard 8N1 and the given baud rate.
 fn open_modem_port(port_name: &str, baud_rate: u32) -> Result<Box<dyn SerialPort>, Box<dyn Error>> {
     let port = serialport::new(port_name, baud_rate)
-        .timeout(Duration::from_millis(2000))
+        .timeout(Duration::from_millis(500))
         .data_bits(DataBits::Eight)
         .parity(Parity::None)
         .stop_bits(StopBits::One)
-        .flow_control(FlowControl::None)
+        .flow_control(FlowControl::Hardware)
         .open()?;
     Ok(port)
 }
 
 /// Send typical AT commands to reset the modem and ensure V.92 is enabled.
-fn init_modem(port: Arc<Mutex<Box<dyn SerialPort + Send>>>) -> Result<(), Box<dyn Error>> {
-    let mut port_guard = port.lock().unwrap(); // Lock the port once for the function
-
+fn init_modem(port: &mut Box<(dyn SerialPort + Send)>) -> Result<(), Box<dyn Error>> {
     // Send the ATZ command to reset the modem
-    std::io::Write::write_all(&mut *port_guard, b"ATZ\r")?;
-    port_guard.flush()?; // Flush to ensure data is sent
+    std::io::Write::write_all(&mut *port, b"ATZ\r")?;
+    port.flush()?; // Flush to ensure data is sent
     std::thread::sleep(Duration::from_millis(500));
 
     // Send the AT&F1 command to load factory settings
-    std::io::Write::write_all(&mut *port_guard, b"AT&F1\r")?;
-    port_guard.flush()?;
+    std::io::Write::write_all(&mut *port, b"AT&F1\r")?;
+    port.flush()?;
     std::thread::sleep(Duration::from_millis(500));
 
     // Send the AT+MS command to configure V.92 settings
-    std::io::Write::write_all(&mut *port_guard, b"AT+MS=V92,1,300,56000,300,48000\r")?;
-    port_guard.flush()?;
+    std::io::Write::write_all(&mut *port, b"AT+MS=V92,1,300,56000,300,48000\r")?;
+    port.flush()?;
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Send the RTS/CTS HARDWARE flow control settings
+    std::io::Write::write_all(&mut *port, b"AT+IFC=2,2\r")?; //1,1 software control.
+    port.flush()?;
     std::thread::sleep(Duration::from_millis(500));
 
     // Read and display the modem response (optional)
     let mut buf = [0u8; 1024];
-    match std::io::Read::read(&mut *port_guard, &mut buf) {
+    match std::io::Read::read(&mut *port, &mut buf) {
         Ok(n) if n > 0 => {
             let resp = String::from_utf8_lossy(&buf[..n]);
             println!("Modem response:\n{}", resp);
@@ -158,16 +171,15 @@ fn init_modem(port: Arc<Mutex<Box<dyn SerialPort + Send>>>) -> Result<(), Box<dy
 /// Dials a phone number, waits for "CONNECT",
 /// parses the speed, then calls `chat_loop`.
 fn dial_number(
-    port: Arc<Mutex<Box<dyn SerialPort + Send>>>,
+    mut port: Box<dyn SerialPort + Send>,
     phone_number: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let mut port_guard = port.lock().unwrap(); // Lock the port once for the function
 
     // 1) Send dial command
     let cmd = format!("ATD{}\r", phone_number);
-    std::io::Write::write_all(&mut *port_guard, cmd.as_bytes())?;
+    std::io::Write::write_all(&mut *port, cmd.as_bytes())?;
 
-    let mut reader = BufReader::new(port_guard.try_clone()?);
+    let mut reader = BufReader::new(port.try_clone()?);
 
     let mut response_line = String::new();
 
@@ -202,7 +214,7 @@ fn dial_number(
                     println!("/receive");
                     println!("/quit");
                     // Now jump into chat mode
-                    chat_loop(Arc::clone(&port));
+                    chat_loop(port);
                     break; // exit function
                 }
 
@@ -218,13 +230,11 @@ fn dial_number(
     Ok(())
 }
 
-fn answer_call(port: Arc<Mutex<Box<dyn SerialPort + Send>>>) -> Result<(), Box<dyn Error>> {
-    let mut port_guard = port.lock().unwrap(); // Lock the port once for the function
-                                               // 1) Tell modem to auto-answer on the first ring
-    let _ = std::io::Write::write_all(&mut *port_guard, b"ATS0=1\r");
-    port_guard.flush()?;
+fn answer_call(mut port: Box<dyn SerialPort + Send>) -> Result<(), Box<dyn Error>> {
+    // 1) Tell modem to auto-answer on the first ring
+    let _ = std::io::Write::write_all(&mut *port, b"ATS0=1\r");
 
-    let mut reader = BufReader::new(port_guard.try_clone()?);
+    let mut reader = BufReader::new(port.try_clone()?);
     let mut line = String::new();
 
     loop {
@@ -243,7 +253,7 @@ fn answer_call(port: Arc<Mutex<Box<dyn SerialPort + Send>>>) -> Result<(), Box<d
                     println!("/send filename");
                     println!("/receive");
                     println!("/quit");
-                    chat_loop(Arc::clone(&port));
+                    chat_loop(port); // Pass ownership to chat_loop
                     break;
                 }
             }
@@ -257,122 +267,212 @@ fn answer_call(port: Arc<Mutex<Box<dyn SerialPort + Send>>>) -> Result<(), Box<d
     Ok(())
 }
 
-fn chat_loop(port: Arc<Mutex<Box<dyn SerialPort + Send>>>) {
-    let stdout = Arc::new(Mutex::new(io::BufWriter::new(io::stdout())));
+/// Function to handle chat operations with the modem.
+/// This function sets up a dedicated serial port handler thread, along with reader and writer threads.
+/// It uses message passing via channels to avoid Mutex lock contention.
+fn chat_loop(port: Box<dyn SerialPort + Send>) {
+    // Create channels for communication
+    let (cmd_sender, cmd_receiver): (Sender<SerialCommand>, Receiver<SerialCommand>) = unbounded();
+    let (data_sender, data_receiver): (Sender<String>, Receiver<String>) = unbounded();
+
+    // Atomic flag to indicate whether the application is running
     let running = Arc::new(AtomicBool::new(true));
 
-    // Thread for reading from modem
-    let reader_handle = {
-        let port_clone: Arc<Mutex<Box<dyn SerialPort + Send>>> = Arc::clone(&port);
-        let stdout_clone = Arc::clone(&stdout);
-        let running_clone: Arc<AtomicBool> = Arc::clone(&running);
+    // Clone references for the serial port handler thread
+    let running_handler = Arc::clone(&running);
+    let cmd_receiver_handler = cmd_receiver.clone();
+    let data_sender_handler = data_sender.clone();
 
-        thread::spawn(move || {
-            let mut read_buf = String::new();
-            while running_clone.load(Ordering::SeqCst) {
-                match port_clone.lock() {
-                    Ok(mut p) => {
-                        let mut reader = BufReader::new(&mut **p);
-                        match reader.read_line(&mut read_buf) {
-                            Ok(0) => {
-                                // If 0 bytes read, it typically indicates EOF or no data.
-                                // You might want to sleep briefly to avoid a tight loop.
-                                thread::sleep(Duration::from_millis(50));
+    // Spawn the serial port handler thread
+    let serial_handler = thread::spawn(move || {
+        let mut port = port;
+
+        loop {
+            // Check if we should terminate
+            if !running_handler.load(Ordering::SeqCst) {
+                println!("Serial Handler: Shutting down.");
+                break;
+            }
+
+            // Handle incoming commands
+            match cmd_receiver_handler.try_recv() {
+                Ok(cmd) => {
+                    match cmd {
+                        SerialCommand::Write(msg) => {
+                            if let Err(e) = writeln!(port, "{}", msg) {
+                                eprintln!("Serial Handler: Error writing to modem: {}", e);
                             }
-                            Ok(_n) => {
-                                let mut stdout = stdout_clone.lock().unwrap();
-                                println!("(modem) {}", read_buf);
-                                if stdout.flush().is_err() {
-                                    eprintln!("Error flushing stdout");
-                                }
-                                read_buf.clear();
-                            }
-                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                            Err(e) => {
-                                eprintln!("Error reading from modem: {}", e);
-                                break;
+                            if let Err(e) = port.flush() {
+                                eprintln!("Serial Handler: Error flushing port: {}", e);
                             }
                         }
-                    },
-                    Err(e) => {
-                        eprintln!("Failed to lock port: {}", e);
+                        SerialCommand::SendZmodem(path) => {
+                            if let Err(e) = zmodem2_send(port.as_mut(), &path) {
+                                eprintln!("Serial Handler: ZMODEM2 send error: {}", e);
+                            }
+                        }
+                        SerialCommand::ReceiveZmodem(dest) => {
+                            if let Err(e) = zmodem2_recv(port.as_mut(), &dest) {
+                                eprintln!("Serial Handler: ZMODEM2 receive error: {}", e);
+                            }
+                        }
+                        SerialCommand::Quit => {
+                            println!("Serial Handler: Quit command received.");
+                            running_handler.store(false, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    // No commands to process, continue
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    println!("Serial Handler: Command channel disconnected.");
+                    break;
+                }
+            }
+
+            // Read data from the serial port
+            let mut buf = [0u8; 1024];
+            match std::io::Read::read(&mut port, &mut buf) {
+                Ok(n) if n > 0 => {
+                    // Convert bytes to string
+                    match String::from_utf8(buf[..n].to_vec()) {
+                        Ok(s) => {
+                            // Send the received data to the data_receiver
+                            if let Err(e) = data_sender_handler.send(s) {
+                                eprintln!("Serial Handler: Error sending data to receiver: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Serial Handler: Received invalid UTF-8 data: {}", e);
+                        }
+                    }
+                }
+                Ok(_) => {
+                    // No data received, continue
+                }
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                    // Read timed out, continue
+                }
+                Err(e) => {
+                    eprintln!("Serial Handler: Error reading from modem: {}", e);
+                    break;
+                }
+            }
+
+            // Sleep briefly to prevent tight looping
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        println!("Serial Handler: Exiting.");
+    });
+
+    // Clone the data receiver for the reader thread
+    let data_receiver_clone = data_receiver.clone();
+    let running_clone_reader = Arc::clone(&running);
+
+    // Spawn the reader thread to handle incoming data
+    let reader_handle = thread::spawn(move || {
+        while running_clone_reader.load(Ordering::SeqCst) {
+            match data_receiver_clone.recv_timeout(Duration::from_millis(100)) {
+                Ok(data) => {
+                    println!("(modem) {}", data.trim_end());
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    // No data received within timeout, continue
+                }
+                Err(_) => {
+                    // Channel disconnected
+                    break;
+                }
+            }
+        }
+        println!("Reader thread: Exiting.");
+    });
+
+    // Clone the command sender for the writer thread
+    let cmd_sender_clone = cmd_sender.clone();
+    let running_clone_writer = Arc::clone(&running);
+
+    // Spawn the writer thread to handle user input
+    let writer_handle = thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut stdin_lock = stdin.lock();
+        let mut input = String::new();
+
+        while running_clone_writer.load(Ordering::SeqCst) {
+            print!("> "); // Prompt for user input
+            io::stdout().flush().expect("Failed to flush stdout");
+
+            input.clear();
+            match stdin_lock.read_line(&mut input) {
+                Ok(n) => {
+                    if n == 0 {
+                        // EOF reached
                         break;
                     }
-                }
-            }
-        })
-    };
 
-    // Thread for handling user input
-    let writer_handle = {
-        let port_clone: Arc<Mutex<Box<dyn SerialPort + Send>>> = Arc::clone(&port);
-        let running_clone: Arc<AtomicBool> = Arc::clone(&running);
-        let mut input_line = String::new();
+                    let trimmed = input.trim_end().to_string();
 
-        thread::spawn(move || {
-            let stdin = io::stdin();
-
-            while running_clone.load(Ordering::SeqCst) {
-                let mut stdin_lock = stdin.lock();
-                if let Ok(n) = stdin_lock.read_line(&mut input_line) {
-                    if n > 0 {
-                        match Some(input_line.trim().to_string()) {
-                            Some(trimmed) => {
-                                input_line.clear(); // For next line
-                                println!("Sending...{}", trimmed);
-                                if trimmed.starts_with("/send ") {
-                                    if let Some(path) =
-                                        trimmed.strip_prefix("/send ").map(str::trim)
-                                    {
-                                        if !path.is_empty() {
-                                            if let Err(e) =
-                                                zmodem2_send(Arc::clone(&port_clone), path)
-                                            {
-                                                eprintln!("ZMODEM2 send error: {}", e);
-                                            }
-                                        } else {
-                                            println!("Usage: /send <file_path>");
-                                        }
-                                    }
-                                } else if trimmed == "/receive" {
-                                    if let Err(e) = zmodem2_recv(Arc::clone(&port_clone), ".") {
-                                        eprintln!("ZMODEM2 receive error: {}", e);
-                                    }
-                                } else if trimmed == "/quit" {
-                                    println!("Leaving chat mode...");
-                                    running_clone.store(false, Ordering::SeqCst);
-                                    return; // Exit the thread immediately
-                                } else {
-                                    {
-                                        let mut port = port_clone.lock().unwrap();
-                                        if let Err(e) = std::io::Write::write_all(
-                                            &mut **port,
-                                            trimmed.as_bytes(),
-                                        ) {
-                                            eprintln!("Error writing to modem: {}", e);
-                                        }
-                                        if let Err(e) =
-                                            std::io::Write::write_all(&mut **port, b"\n")
-                                        {
-                                            eprintln!("Error writing newline to modem: {}", e);
-                                        }
-                                        port.flush().ok(); // Ensure data is sent immediately
-                                    }
-                                }
+                    if trimmed.starts_with("/send ") {
+                        let path = trimmed.strip_prefix("/send ").unwrap().trim().to_string();
+                        if !path.is_empty() {
+                            if let Err(e) = cmd_sender_clone.send(SerialCommand::SendZmodem(path)) {
+                                eprintln!("Writer thread: Error sending ZMODEM2 send command: {}", e);
                             }
-                            None => {
-                                //unimplemented.
-                            }
+                        } else {
+                            println!("Usage: /send <file_path>");
+                        }
+                    } else if trimmed == "/receive" {
+                        let destination = ".".to_string(); // Current directory
+                        if let Err(e) = cmd_sender_clone.send(SerialCommand::ReceiveZmodem(destination)) {
+                            eprintln!("Writer thread: Error sending ZMODEM2 receive command: {}", e);
+                        }
+                    } else if trimmed == "/quit" {
+                        if let Err(e) = cmd_sender_clone.send(SerialCommand::Quit) {
+                            eprintln!("Writer thread: Error sending Quit command: {}", e);
+                        }
+                        break; // Exit the loop
+                    } else {
+                        // Send raw input to the modem
+                        if let Err(e) = cmd_sender_clone.send(SerialCommand::Write(trimmed.clone())) {
+                            eprintln!("Writer thread: Error sending write command: {}", e);
                         }
                     }
                 }
+                Err(e) => {
+                    eprintln!("Writer thread: Error reading from stdin: {}", e);
+                    break;
+                }
             }
-        })
-    };
+        }
 
-    // Wait for threads to finish
-    reader_handle.join().unwrap();
-    writer_handle.join().unwrap();
+        println!("Writer thread: Exiting.");
+    });
+
+    // Wait for the application to terminate gracefully
+    // This loop keeps the main thread alive until the running flag is set to false
+    while running.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    // Wait for the handler thread to finish
+    serial_handler.join().unwrap_or_else(|e| {
+        eprintln!("Main thread: Serial handler thread panicked: {:?}", e);
+    });
+
+    // Wait for the reader thread to finish
+    reader_handle.join().unwrap_or_else(|e| {
+        eprintln!("Main thread: Reader thread panicked: {:?}", e);
+    });
+
+    // Wait for the writer thread to finish
+    writer_handle.join().unwrap_or_else(|e| {
+        eprintln!("Main thread: Writer thread panicked: {:?}", e);
+    });
+
+    println!("Main thread: Chat terminated.");
 }
 
 // --------------------------------------------------------------------
@@ -498,7 +598,7 @@ impl ZSeek for LocalFile {
 
 /// Send a file using the zmodem2 crate in a loop until the transfer is `Done`.
 fn zmodem2_send(
-    port: Arc<Mutex<Box<dyn SerialPort + Send>>>,
+    port: &mut dyn SerialPort,
     file_path: &str,
 ) -> Result<(), Box<dyn Error>> {
     let path = Path::new(file_path);
@@ -517,11 +617,8 @@ fn zmodem2_send(
     let mut state =
         ZState::new_file(file_path, size_u32).map_err(|_| "Failed to create ZMODEM2 State")?;
 
-    let mut port_guard = port.lock().unwrap();
-    let port_ref = &mut **port_guard;
-
     let mut zport = ZPort {
-        port: port_ref as &mut dyn SerialPort,
+        port: port,
     };
 
     println!("Sending '{}' ({} bytes) via ZMODEM2...", file_path, size);
@@ -553,16 +650,14 @@ fn zmodem2_send(
 /// we create a `State::new()` and then open the file once we discover its name
 /// in the subpacket.
 fn zmodem2_recv(
-    port: Arc<Mutex<Box<dyn SerialPort + Send>>>,
+    port: &mut dyn SerialPort,
     output_dir: &str,
 ) -> Result<(), Box<dyn Error>> {
-    let mut port_guard = port.lock().unwrap();
     let mut state = ZState::new(); // start with an empty (no-file) state
     let mut maybe_out_file: Option<LocalFile> = None;
 
-    let port_ref = &mut **port_guard;
     let mut zport = ZPort {
-        port: port_ref as &mut dyn SerialPort,
+        port: port,
     };
 
     println!("Awaiting inbound ZMODEM2 file transfer...");
