@@ -61,6 +61,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                         Ok(port) => {
                             println!("Opened serial port: {}", port_path);
                             maybe_port = Some(port);
+
+                            if let Some(ref mut port) = maybe_port {
+                                if let Err(e) = init_modem(port) {
+                                    eprintln!("Modem init error: {}", e);
+                                } else {
+                                    println!("Modem initialized.");
+                                }
+                            } else {
+                                eprintln!("No serial port is open. Use 'setport' first.");
+                            }
                         }
                         Err(e) => eprintln!("Failed to open port: {}", e),
                     }
@@ -94,6 +104,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 } else {
                     eprintln!("Usage: dial <phone_number>");
                 }
+                println!("Exiting.");
+                drop(Some(maybe_port));
+                break;
             }
 
             "answer" => {
@@ -104,6 +117,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 } else {
                     eprintln!("No serial port is open. Use 'setport' first.");
                 }
+                println!("Exiting.");
+                drop(Some(maybe_port));
+                break;
             }
 
             "quit" => {
@@ -124,7 +140,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// Open a serial port with standard 8N1 and the given baud rate.
 fn open_modem_port(port_name: &str, baud_rate: u32) -> Result<Box<dyn SerialPort>, Box<dyn Error>> {
     let port = serialport::new(port_name, baud_rate)
-        .timeout(Duration::from_millis(5000))
+        .timeout(Duration::from_millis(500))
         .data_bits(DataBits::Eight)
         .parity(Parity::None)
         .stop_bits(StopBits::One)
@@ -210,9 +226,8 @@ fn dial_number(
                             eprintln!("Dial-up connected. Could not parse speed: {}", speed_str);
                         }
                     }
-                    println!("Entered CHAT mode!");
+                    println!("Entered CHAT mode! - chat or use the following commands:");
                     println!("/send filename");
-                    println!("/receive");
                     println!("/quit");
                     // Now jump into chat mode
                     chat_loop(port);
@@ -250,7 +265,7 @@ fn answer_call(mut port: Box<dyn SerialPort + Send>) -> Result<(), Box<dyn Error
                 eprintln!("Modem says: {}", trimmed);
 
                 if trimmed.starts_with("CONNECT") {
-                    println!("Entered CHAT mode!");
+                    println!("Entered CHAT mode! - chat or use the following commands:");
                     println!("/send filename");
                     println!("/quit");
                     chat_loop(port); // Pass ownership to chat_loop
@@ -290,7 +305,7 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
         loop {
             // Check if we should terminate
             if !running_handler.load(Ordering::SeqCst) {
-                println!("Serial Handler: Shutting down.");
+                //println!("Serial Handler: Shutting down.");
                 break;
             }
 
@@ -307,17 +322,21 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
                             }
                         }
                         SerialCommand::SendZmodem(path) => {
+                            let _ = port.set_timeout(Duration::from_secs(10));
                             if let Err(e) = zmodem2_send(port.as_mut(), &path) {
                                 eprintln!("Serial Handler: ZMODEM2 send error: {}", e);
                             }
+                            let _ = port.set_timeout(Duration::from_millis(500));
                         }
                         SerialCommand::ReceiveZmodem(dest) => {
+                            let _ = port.set_timeout(Duration::from_secs(10));
                             if let Err(e) = zmodem2_receive(port.as_mut(), &dest) {
                                 eprintln!("Serial Handler: ZMODEM2 receive error: {}", e);
                             }
+                            let _ = port.set_timeout(Duration::from_millis(500));
                         }
                         SerialCommand::Quit => {
-                            println!("Serial Handler: Quit command received.");
+                            //println!("Serial Handler: Quit command received.");
                             running_handler.store(false, Ordering::SeqCst);
                             break;
                         }
@@ -364,8 +383,8 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
             // Sleep briefly to prevent tight looping
             thread::sleep(Duration::from_millis(10));
         }
-
-        println!("Serial Handler: Exiting.");
+        drop(data_sender_handler);
+        //println!("Serial Handler: Exiting.");
     });
 
     // Clone the data receiver for the reader thread
@@ -376,18 +395,15 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
 
     // Spawn the reader thread to handle incoming data
     let reader_handle = thread::spawn(move || {
-        while running_clone_reader.load(Ordering::SeqCst) {
-            match data_receiver_clone.recv() {
+        loop {
+            match data_receiver_clone.try_recv() {
                 Ok(data) => {
-                    if data.contains("B00000000000000"){ // incomming file.
-                        //receiving a file
-                        let path = Path::new("INCOMING"); //
-    
-                        // Check if the directory exists, and create it if it doesn't
+                    if data.contains("B00000000000000") {
+                        let path = Path::new("INCOMING");
                         if !path.exists() {
                             let _ = fs::create_dir(path);
                         }
-                        let destination = path.to_string_lossy().to_string(); // Current directory
+                        let destination = path.to_string_lossy().to_string();
                         if let Err(e) = cmd_sender_clone.send(SerialCommand::ReceiveZmodem(destination)) {
                             eprintln!("Writer thread: Error sending ZMODEM2 receive command: {}", e);
                         }
@@ -395,16 +411,20 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
                         println!("(modem) {}", data.trim_end());
                     }
                 }
-                //Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    // No data received within timeout, continue
-                //}
-                Err(_) => {
-                    // Channel disconnected
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    // No data available, check the running flag
+                    if !running_clone_reader.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    // Channel disconnected, exit
                     break;
                 }
             }
         }
-        println!("Reader thread: Exiting.");
+        //println!("Reader thread: Exiting.");
     });
 
     // Clone the command sender for the writer thread
@@ -459,7 +479,7 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
             }
         }
 
-        println!("Writer thread: Exiting.");
+        //println!("Writer thread: Exiting.");
     });
 
     // Wait for the application to terminate gracefully
@@ -468,9 +488,10 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
         thread::sleep(Duration::from_secs(1));
     }
 
-    // Wait for the handler thread to finish
-    serial_handler.join().unwrap_or_else(|e| {
-        eprintln!("Main thread: Serial handler thread panicked: {:?}", e);
+
+    // Wait for the writer thread to finish
+    writer_handle.join().unwrap_or_else(|e| {
+        eprintln!("Main thread: Writer thread panicked: {:?}", e);
     });
 
     // Wait for the reader thread to finish
@@ -478,12 +499,12 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
         eprintln!("Main thread: Reader thread panicked: {:?}", e);
     });
 
-    // Wait for the writer thread to finish
-    writer_handle.join().unwrap_or_else(|e| {
-        eprintln!("Main thread: Writer thread panicked: {:?}", e);
+    // Wait for the handler thread to finish
+    serial_handler.join().unwrap_or_else(|e| {
+        eprintln!("Main thread: Serial handler thread panicked: {:?}", e);
     });
 
-    println!("Main thread: Chat terminated.");
+    println!("Chat terminated.GoodBye!");
 }
 
 // --------------------------------------------------------------------
