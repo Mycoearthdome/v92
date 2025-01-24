@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-crossbeam = "0.8.4"
 crossbeam-channel = "0.5.14"
 serialport = "4.7.0"
 zmodem2 = "0.1.2"
