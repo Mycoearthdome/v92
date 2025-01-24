@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use indicatif::ProgressBar;
 
 // Pull in zmodem2's symbols
 use zmodem2::{
@@ -26,7 +27,7 @@ enum SerialCommand {
 
 /// Main entry point: run a simple shell for V.92 + ZMODEM2.
 fn main() -> Result<(), Box<dyn Error>> {
-    println!("=== V.92 Modem Chat + ZMODEM2 File-Transfer ===");
+    println!("=== V.92 Modem Chat + ZMODEM File-Transfer ===");
     println!("Commands:");
     println!("  setport <path>   - set serial port (e.g., COM3 or /dev/ttyUSB0)");
     println!("  init             - initialize modem (V.92, etc.)");
@@ -405,7 +406,7 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
                         }
                         let destination = path.to_string_lossy().to_string();
                         if let Err(e) = cmd_sender_clone.send(SerialCommand::ReceiveZmodem(destination)) {
-                            eprintln!("Writer thread: Error sending ZMODEM2 receive command: {}", e);
+                            eprintln!("Writer thread: Error sending ZMODEM receive command: {}", e);
                         }
                     } else {
                         println!("(modem) {}", data.trim_end());
@@ -455,7 +456,7 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
                         let path = trimmed.strip_prefix("/send ").unwrap().trim().to_string();
                         if !path.is_empty() {
                             if let Err(e) = cmd_sender_clone.send(SerialCommand::SendZmodem(path)) {
-                                eprintln!("Writer thread: Error sending ZMODEM2 send command: {}", e);
+                                eprintln!("Writer thread: Error sending ZMODEM send command: {}", e);
                             }
                         } else {
                             println!("Usage: /send <file_path>");
@@ -623,7 +624,7 @@ pub fn zmodem2_send(port: &mut dyn SerialPort, file_path: &str) -> Result<(), Bo
     let mut zport = ZPort { port };
     let mut state = ZState::new_file(file_path, size).unwrap();
 
-    println!("Sending '{}' ({} bytes) via ZMODEM2...", file_path, size);
+    println!("Sending '{}' ({} bytes) via ZMODEM...", file_path, size);
 
     loop {
         // Call `send` and handle the result
@@ -638,7 +639,7 @@ pub fn zmodem2_send(port: &mut dyn SerialPort, file_path: &str) -> Result<(), Bo
             Err(e) => {
                 // If `send` fails, handle the error
                 eprintln!("Error during send: {:?}", e);
-                //break; // Exit the loop or implement retry logic
+                break; // Exit the loop or implement retry logic
             }
         }
     
@@ -658,7 +659,7 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
     let mut state = ZState::new();
     let mut done:bool = false;
 
-    println!("Awaiting inbound ZMODEM2 file transfer...");
+    println!("Awaiting inbound ZMODEM file transfer...");
 
     loop {
         if !state.file_name().is_empty() && state.file_size() > 0 {
@@ -671,21 +672,26 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
                 state.file_size()
             );
 
+            let bar = ProgressBar::new(state.file_size().into());
+
             loop {
                 // Call `receive` and handle the result
                 match receive(&mut zport, &mut file, &mut state) {
                     Ok(()) => {
                         // If `receive` succeeds, check if the stage is `Done`
                         if state.stage() == ZStage::Done {
+                            bar.finish_and_clear();
                             println!("File '{}' received successfully!", state.file_name());
                             done = true;
                             break; // Exit the loop when the transfer is complete
+                        } else {
+                            bar.set_position(state.count().into());
                         }
                     }
                     Err(e) => {
                         // If `receive` fails, handle the error
                         eprintln!("Error during receive: {:?}", e);
-                        //break; // Exit the loop or implement retry logic
+                        break; // Exit the loop or implement retry logic
                     }
                 }
             
