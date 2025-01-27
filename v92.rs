@@ -315,6 +315,7 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
                     match cmd {
                         SerialCommand::Write(msg) => {
                             if let Err(e) = writeln!(port, "{}", msg) {
+                                //TODO:CHECK IF THERE IS A CARRIAGE RETURN IN THERE....
                                 eprintln!("Serial Handler: Error writing to modem: {}", e);
                             }
                             if let Err(e) = port.flush() {
@@ -326,14 +327,14 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
                             if let Err(e) = zmodem2_send(port.as_mut(), &path) {
                                 eprintln!("Serial Handler: ZMODEM2 send error: {}", e);
                             }
-                            let _ = port.set_timeout(Duration::from_millis(500));
+                            //let _ = port.set_timeout(Duration::from_millis(500)); //TODO:Put bacj for chat after be responsive.
                         }
                         SerialCommand::ReceiveZmodem(dest) => {
                             let _ = port.set_timeout(Duration::from_secs(10));
                             if let Err(e) = zmodem2_receive(port.as_mut(), &dest) {
                                 eprintln!("Serial Handler: ZMODEM2 receive error: {}", e);
                             }
-                            let _ = port.set_timeout(Duration::from_millis(500));
+                            //let _ = port.set_timeout(Duration::from_millis(500));
                         }
                         SerialCommand::Quit => {
                             //println!("Serial Handler: Quit command received.");
@@ -632,7 +633,9 @@ pub fn zmodem2_send(port: &mut dyn SerialPort, file_path: &str) -> Result<(), Bo
 
     let size = std::fs::metadata(path)?.len() as u32;
     let mut file = File::open(path)?;
-    let mut zport = ZPort { port };
+    let mut zport = ZPort {
+        port: &mut *port.try_clone()?,
+    };
     let mut state = ZState::new_file(file_path, size).unwrap();
 
     println!("Sending '{}' ({} bytes) via ZMODEM...", file_path, size);
@@ -653,9 +656,40 @@ pub fn zmodem2_send(port: &mut dyn SerialPort, file_path: &str) -> Result<(), Bo
                 }
             }
             Err(e) => {
+                let mut resumefile = File::create("resume.file")?;
                 // Handle transfer interruption and retry
                 eprintln!("Error during send: {:?}. Retrying...", e);
-                let _ = file.seek(state.count());
+                //let mut reader = BufReader::new(port.try_clone()?);
+                //let mut line = String::new();
+                let mut buffer = [0u8;4];
+                loop {
+                    match zport.read(&mut buffer){
+                        Ok(n) => {
+                            if n > 0 {
+                                let offset = u32::from_le_bytes(buffer);
+                                eprintln!("OFFSET = {}", offset);
+                                let _ = file.seek(offset);
+                                // Buffer for reading bytes
+                                let mut buffer = [0; 1024];
+        
+                                // Read and write loop
+                                loop {
+                                    let bytes_read = std::io::Read::read(&mut file, &mut buffer)?;
+                                    if bytes_read == 0 {
+                                        break;
+                                    }
+                                    let _ =
+                                        std::io::Write::write_all(&mut resumefile, &buffer[..bytes_read]);
+                                }
+                                file = resumefile;
+                                break;
+                            }
+                        }
+                        Err(_e) =>{
+                            continue
+                        }
+                    }
+                }
                 //std::thread::sleep(Duration::from_millis(500)); // Pause before retrying
                 continue;
             }
@@ -725,6 +759,10 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
                     Err(e) => {
                         // Handle transfer interruption and retry
                         eprintln!("Error during receive: {:?}. Retrying...", e);
+                        std::thread::sleep(Duration::from_millis(2000)); // Pause before retrying
+                        eprintln!("Sending progress={}", state.count().to_string());
+                        let _ = zport.write_all(&state.count().to_le_bytes());
+                        //SerialCommand::Write(state.count().to_string());
                         //std::thread::sleep(Duration::from_millis(500)); // Pause before retrying
                         continue; // Retry without breaking out of the loop
                     }
