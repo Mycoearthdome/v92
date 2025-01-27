@@ -726,7 +726,7 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
     loop {
         if !state.file_name().is_empty() && state.file_size() > 0 {
             let out_path = Path::new(output_dir).join(state.file_name());
-
+            bar.set_length(state.file_size().into());
             // Open the file for appending or create a new one
             if file.is_none() {
                 if out_path.exists() {
