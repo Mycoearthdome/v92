@@ -661,33 +661,36 @@ pub fn zmodem2_send(port: &mut dyn SerialPort, file_path: &str) -> Result<(), Bo
                 eprintln!("Error during send: {:?}. Retrying...", e);
                 //let mut reader = BufReader::new(port.try_clone()?);
                 //let mut line = String::new();
-                let mut buffer = [0u8;4];
+                let mut buffer = [0u8; 4];
                 loop {
-                    match zport.read(&mut buffer){
+                    match zport.read(&mut buffer) {
                         Ok(n) => {
                             if n > 0 {
                                 let offset = u32::from_le_bytes(buffer);
-                                eprintln!("OFFSET = {}", offset);
-                                let _ = file.seek(offset);
-                                // Buffer for reading bytes
-                                let mut buffer = [0; 1024];
-        
-                                // Read and write loop
-                                loop {
-                                    let bytes_read = std::io::Read::read(&mut file, &mut buffer)?;
-                                    if bytes_read == 0 {
-                                        break;
+                                if offset >= state.count() {
+                                    eprintln!("OFFSET = {}", offset);
+                                    let _ = file.seek(offset);
+                                    // Buffer for reading bytes
+                                    let mut buffer = [0; 1024];
+
+                                    // Read and write loop
+                                    loop {
+                                        let bytes_read =
+                                            std::io::Read::read(&mut file, &mut buffer)?;
+                                        if bytes_read == 0 {
+                                            break;
+                                        }
+                                        let _ = std::io::Write::write_all(
+                                            &mut resumefile,
+                                            &buffer[..bytes_read],
+                                        );
                                     }
-                                    let _ =
-                                        std::io::Write::write_all(&mut resumefile, &buffer[..bytes_read]);
+                                    file = resumefile;
+                                    break;
                                 }
-                                file = resumefile;
-                                break;
                             }
                         }
-                        Err(_e) =>{
-                            continue
-                        }
+                        Err(_e) => continue,
                     }
                 }
                 //std::thread::sleep(Duration::from_millis(500)); // Pause before retrying
@@ -709,7 +712,6 @@ pub fn zmodem2_send(port: &mut dyn SerialPort, file_path: &str) -> Result<(), Bo
 pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<(), Box<dyn Error>> {
     let mut zport = ZPort { port };
     let mut state = ZState::new();
-    let mut done: bool = false;
 
     println!("Awaiting inbound ZMODEM file transfer...");
 
@@ -743,39 +745,39 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
             let bar = ProgressBar::new(state.file_size().into());
             bar.set_position(state.count().into());
 
-            loop {
-                // Call `receive` and handle the result
-                match receive(&mut zport, file.as_mut().unwrap(), &mut state) {
-                    Ok(()) => {
-                        if state.stage() == ZStage::Done {
-                            bar.finish_and_clear();
-                            println!("File '{}' received successfully!", state.file_name());
-                            done = true;
-                            break; // Exit the loop when the transfer is complete
-                        } else {
-                            bar.set_position(state.count().into());
-                        }
-                    }
-                    Err(e) => {
-                        // Handle transfer interruption and retry
-                        eprintln!("Error during receive: {:?}. Retrying...", e);
-                        std::thread::sleep(Duration::from_millis(2000)); // Pause before retrying
-                        eprintln!("Sending progress={}", state.count().to_string());
-                        let _ = zport.write_all(&state.count().to_le_bytes());
-                        //SerialCommand::Write(state.count().to_string());
-                        //std::thread::sleep(Duration::from_millis(500)); // Pause before retrying
-                        continue; // Retry without breaking out of the loop
+            match receive(&mut zport, file.as_mut().unwrap(), &mut state) {
+                Ok(()) => {
+                    if state.stage() == ZStage::Done {
+                        bar.finish_and_clear();
+                        println!("File '{}' received successfully!", state.file_name());
+                        break; // Exit the loop when the transfer is complete
+                    } else {
+                        bar.set_position(state.count().into());
                     }
                 }
-
-                // Sleep briefly to avoid a tight loop
-                std::thread::sleep(Duration::from_millis(50));
+                Err(e) => {
+                    // Handle transfer interruption and retry
+                    eprintln!("Error during receive: {:?}. Retrying...", e);
+                    std::thread::sleep(Duration::from_millis(2000)); // Pause before retrying
+                    eprintln!("Sending progress={}", state.count().to_string());
+                    let _ = zport.write_all(&state.count().to_le_bytes());
+                    file = None;
+                    match receive(&mut zport, &mut io::sink(), &mut state) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            eprintln!("Error during initial receive: {:?}", e);
+                            std::thread::sleep(Duration::from_millis(500)); // Pause before retrying
+                        }
+                    }
+                    //std::thread::sleep(Duration::from_millis(500)); // Pause before retrying
+                    continue; // Retry without breaking out of the loop
+                }
             }
+
+            // Sleep briefly to avoid a tight loop
+            std::thread::sleep(Duration::from_millis(50));
 
             // Clean up if the transfer is complete
-            if done {
-                file = None;
-            }
         } else {
             // Initial receive to fetch metadata (e.g., file name and size)
             match receive(&mut zport, &mut io::sink(), &mut state) {
@@ -785,10 +787,6 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
                     std::thread::sleep(Duration::from_millis(500)); // Pause before retrying
                 }
             }
-        }
-
-        if done {
-            break;
         }
 
         // Short pause to avoid tight looping
