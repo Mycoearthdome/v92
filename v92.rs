@@ -667,7 +667,7 @@ pub fn zmodem2_send(port: &mut dyn SerialPort, file_path: &str) -> Result<(), Bo
                         Ok(n) => {
                             if n > 0 {
                                 let offset = u32::from_le_bytes(buffer);
-                                if offset >= state.count() {
+                                if offset >= state.count() && offset < state.file_size(){
                                     eprintln!("OFFSET = {}", offset);
                                     let _ = file.seek(offset);
                                     // Buffer for reading bytes
@@ -712,10 +712,16 @@ pub fn zmodem2_send(port: &mut dyn SerialPort, file_path: &str) -> Result<(), Bo
 pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<(), Box<dyn Error>> {
     let mut zport = ZPort { port };
     let mut state = ZState::new();
+    let mut original_filename = String::new();
+    let mut resumed = false;
+    let mut resume_file = String::new();
 
     println!("Awaiting inbound ZMODEM file transfer...");
 
     let mut file: Option<File> = None;
+
+    // Progress bar setup
+    let bar = ProgressBar::new(state.file_size().into());
 
     loop {
         if !state.file_name().is_empty() && state.file_size() > 0 {
@@ -724,32 +730,32 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
             // Open the file for appending or create a new one
             if file.is_none() {
                 if out_path.exists() {
-                    println!(
-                        "Resuming transfer of '{}', {} bytes received so far...",
-                        state.file_name(),
-                        state.count()
-                    );
+                    println!("Resuming transfer ...");
                     file = Some(File::options().append(true).open(&out_path)?);
                     let _ = file.as_mut().unwrap().seek(state.count());
                 } else {
-                    println!(
-                        "Receiving '{}' ({} bytes)...",
-                        state.file_name(),
-                        state.file_size()
-                    );
+                    println!("Receiving ...");
                     file = Some(File::create(&out_path)?);
+                    if !resumed {
+                        original_filename = out_path
+                            .to_str()
+                            .expect("ERROR: Failed to unpack out_path")
+                            .to_owned();
+                    } else {
+                        resume_file = out_path
+                        .to_str()
+                        .expect("ERROR: Failed to unpack out_path")
+                        .to_owned();
+                    }
                 }
             }
-
-            // Progress bar setup
-            let bar = ProgressBar::new(state.file_size().into());
+            
             bar.set_position(state.count().into());
 
             match receive(&mut zport, file.as_mut().unwrap(), &mut state) {
                 Ok(()) => {
                     if state.stage() == ZStage::Done {
                         bar.finish_and_clear();
-                        println!("File '{}' received successfully!", state.file_name());
                         break; // Exit the loop when the transfer is complete
                     } else {
                         bar.set_position(state.count().into());
@@ -762,6 +768,8 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
                     eprintln!("Sending progress={}", state.count().to_string());
                     let _ = zport.write_all(&state.count().to_le_bytes());
                     file = None;
+                    resumed = true;
+                    bar.finish_and_clear();
                     match receive(&mut zport, &mut io::sink(), &mut state) {
                         Ok(()) => {}
                         Err(e) => {
@@ -792,6 +800,23 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
         // Short pause to avoid tight looping
         std::thread::sleep(Duration::from_millis(50));
     }
+
+    if resumed{
+        let mut original_file = Some(File::options().append(true).open(&original_filename)?);
+        let mut resumefile = File::open(&resume_file)?;
+        let mut buffer = [0; 1024];
+
+        // Read and write loop
+        loop {
+            let bytes_read = std::io::Read::read(&mut resumefile, &mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            let _ = std::io::Write::write_all(original_file.as_mut().expect("ERROR: Couldn't write file"), &buffer[..bytes_read]);
+        }
+    }
+
+    println!("File '{}' received successfully!", original_filename);
 
     Ok(())
 }
