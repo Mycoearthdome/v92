@@ -324,14 +324,14 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
                             }
                         }
                         SerialCommand::SendZmodem(path) => {
-                            let _ = port.set_timeout(Duration::from_secs(15));
+                            let _ = port.set_timeout(Duration::from_secs(20));
                             if let Err(e) = zmodem2_send(port.as_mut(), &path) {
                                 eprintln!("Serial Handler: ZMODEM2 send error: {}", e);
                             }
                             //let _ = port.set_timeout(Duration::from_millis(500)); //TODO:Put back for chat after be responsive.
                         }
                         SerialCommand::ReceiveZmodem(dest) => {
-                            let _ = port.set_timeout(Duration::from_secs(15));
+                            let _ = port.set_timeout(Duration::from_secs(20));
                             if let Err(e) = zmodem2_receive(port.as_mut(), &dest) {
                                 eprintln!("Serial Handler: ZMODEM2 receive error: {}", e);
                             }
@@ -643,7 +643,6 @@ pub fn zmodem2_send(port: &mut dyn SerialPort, file_path: &str) -> Result<(), Bo
     println!("Sending '{}' ({} bytes) via ZMODEM...", file_path, size);
 
     loop {
-
         let bar = ProgressBar::new(state.file_size().into());
         bar.set_position(state.count().into());
 
@@ -670,7 +669,7 @@ pub fn zmodem2_send(port: &mut dyn SerialPort, file_path: &str) -> Result<(), Bo
                         Ok(n) => {
                             if n > 0 {
                                 let mut offset = u32::from_le_bytes(buffer);
-                                if offset >= state.count() && offset < state.file_size(){
+                                if offset >= state.count() && offset < state.file_size() {
                                     eprintln!("OFFSET = {}", offset);
                                     offsets.push(offset);
                                     if offsets.len() == 3 {
@@ -712,7 +711,8 @@ pub fn zmodem2_send(port: &mut dyn SerialPort, file_path: &str) -> Result<(), Bo
                                         // Get the file size
                                         let file_size = metadata.len();
 
-                                        state = ZState::new_file("resume.file", file_size as u32).unwrap();
+                                        state = ZState::new_file("resume.file", file_size as u32)
+                                            .unwrap();
 
                                         break;
                                     }
@@ -754,9 +754,27 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
 
     loop {
         if !state.file_name().is_empty() && state.file_size() > 0 {
+
+            if resumed {
+                eprintln!("Resuming ...");
+                match receive(&mut zport, &mut io::sink(), &mut state) {
+                    Ok(()) => {
+                        state = ZState::new_file("resume.file", state.file_size() as u32).unwrap();
+                    }
+                    Err(e) => {
+                        eprintln!("Error during initial receive: {:?}", e);
+                        std::thread::sleep(Duration::from_millis(500)); // Pause before retrying
+                    }
+                }
+                resumed = false;
+                file = None;
+            }
+
             let out_path = Path::new(output_dir).join(state.file_name());
             bar.set_length(state.file_size().into());
             //bar.set_draw_target(indicatif::ProgressDrawTarget::stderr()); //make the bar visible.
+
+
             // Open the file for appending or create a new one
             if file.is_none() {
                 if out_path.exists() {
@@ -776,6 +794,7 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
                             .to_str()
                             .expect("ERROR: Failed to unpack out_path")
                             .to_owned();
+                        bar = ProgressBar::new(state.file_size() as u64);
                     }
                 }
             }
@@ -794,23 +813,14 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
                 Err(e) => {
                     // Handle transfer interruption and retry
                     eprintln!("Error during receive: {:?}. Retrying...", e);
-                    std::thread::sleep(Duration::from_millis(2000)); // Pause before retrying
+                    std::thread::sleep(Duration::from_millis(2000));
                     eprintln!("Sending progress={}", state.count().to_string());
                     for _ in 0..3 {
                         let _ = zport.write_all(&state.count().to_le_bytes());
                     }
-                    file = None;
+                    //file = None;
                     resumed = true;
                     bar.finish_and_clear();
-                    match receive(&mut zport, &mut io::sink(), &mut state) {
-                        Ok(()) => {
-                            bar = ProgressBar::new(state.file_size() as u64);
-                        }
-                        Err(e) => {
-                            eprintln!("Error during initial receive: {:?}", e);
-                            std::thread::sleep(Duration::from_millis(500)); // Pause before retrying
-                        }
-                    }
                     //std::thread::sleep(Duration::from_millis(500)); // Pause before retrying
                     continue; // Retry without breaking out of the loop
                 }
