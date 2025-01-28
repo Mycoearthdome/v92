@@ -1,6 +1,7 @@
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use indicatif::ProgressBar;
 use serialport::{DataBits, FlowControl, Parity, SerialPort, StopBits};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read as StdRead, Write as StdWrite};
@@ -637,6 +638,7 @@ pub fn zmodem2_send(port: &mut dyn SerialPort, file_path: &str) -> Result<(), Bo
         port: &mut *port.try_clone()?,
     };
     let mut state = ZState::new_file(file_path, size).unwrap();
+    let mut offsets = Vec::new();
 
     println!("Sending '{}' ({} bytes) via ZMODEM...", file_path, size);
 
@@ -666,27 +668,51 @@ pub fn zmodem2_send(port: &mut dyn SerialPort, file_path: &str) -> Result<(), Bo
                     match zport.read(&mut buffer) {
                         Ok(n) => {
                             if n > 0 {
-                                let offset = u32::from_le_bytes(buffer);
-                                if offset >= state.count() && offset < state.file_size(){
-                                    eprintln!("OFFSET = {}", offset);
-                                    let _ = file.seek(offset);
-                                    // Buffer for reading bytes
-                                    let mut buffer = [0; 1024];
-
-                                    // Read and write loop
-                                    loop {
-                                        let bytes_read =
-                                            std::io::Read::read(&mut file, &mut buffer)?;
-                                        if bytes_read == 0 {
-                                            break;
+                                let mut offset = u32::from_le_bytes(buffer);
+                                if offset >= state.count() && offset < state.file_size() {
+                                    offsets.push(offset);
+                                    if offsets.len() == 5 {
+                                        let mut map: HashMap<u32, u8> = HashMap::new();
+                                        for offset in offsets.clone() {
+                                            *map.entry(offset).or_insert(0) += 1;
                                         }
-                                        let _ = std::io::Write::write_all(
-                                            &mut resumefile,
-                                            &buffer[..bytes_read],
-                                        );
+                                        let best_choice = 0;
+                                        for (key, value) in map {
+                                            if value > best_choice {
+                                                offset = key;
+                                            }
+                                        }
+
+                                        eprintln!("OFFSET = {}", offset);
+
+                                        let _ = file.seek(offset);
+                                        // Buffer for reading bytes
+                                        let mut buffer = [0; 1024];
+
+                                        // Read and write loop
+                                        loop {
+                                            let bytes_read =
+                                                std::io::Read::read(&mut file, &mut buffer)?;
+                                            if bytes_read == 0 {
+                                                break;
+                                            }
+                                            let _ = std::io::Write::write_all(
+                                                &mut resumefile,
+                                                &buffer[..bytes_read],
+                                            );
+                                        }
+                                        file = resumefile;
+
+                                        // Get metadata of the file
+                                        let metadata = fs::metadata("resume.file")?;
+
+                                        // Get the file size
+                                        let file_size = metadata.len();
+
+                                        state = ZState::new_file("resume.file", file_size as u32).unwrap();
+                                        
+                                        break;
                                     }
-                                    file = resumefile;
-                                    break;
                                 }
                             }
                         }
@@ -721,12 +747,13 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
     let mut file: Option<File> = None;
 
     // Progress bar setup
-    let bar = ProgressBar::new(state.file_size().into());
+    let bar = ProgressBar::new(0);
 
     loop {
         if !state.file_name().is_empty() && state.file_size() > 0 {
             let out_path = Path::new(output_dir).join(state.file_name());
             bar.set_length(state.file_size().into());
+            //bar.set_draw_target(indicatif::ProgressDrawTarget::stderr()); //make the bar visible.
             // Open the file for appending or create a new one
             if file.is_none() {
                 if out_path.exists() {
@@ -743,13 +770,13 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
                             .to_owned();
                     } else {
                         resume_file = out_path
-                        .to_str()
-                        .expect("ERROR: Failed to unpack out_path")
-                        .to_owned();
+                            .to_str()
+                            .expect("ERROR: Failed to unpack out_path")
+                            .to_owned();
                     }
                 }
             }
-            
+
             bar.set_position(state.count().into());
 
             match receive(&mut zport, file.as_mut().unwrap(), &mut state) {
@@ -766,7 +793,9 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
                     eprintln!("Error during receive: {:?}. Retrying...", e);
                     std::thread::sleep(Duration::from_millis(2000)); // Pause before retrying
                     eprintln!("Sending progress={}", state.count().to_string());
-                    let _ = zport.write_all(&state.count().to_le_bytes());
+                    for _ in 1..10 {
+                        let _ = zport.write_all(&state.count().to_le_bytes()); //TODO:send more at once.
+                    }
                     file = None;
                     resumed = true;
                     bar.finish_and_clear();
@@ -801,7 +830,7 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    if resumed{
+    if resumed {
         let mut original_file = Some(File::options().append(true).open(&original_filename)?);
         let mut resumefile = File::open(&resume_file)?;
         let mut buffer = [0; 1024];
@@ -812,7 +841,10 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
             if bytes_read == 0 {
                 break;
             }
-            let _ = std::io::Write::write_all(original_file.as_mut().expect("ERROR: Couldn't write file"), &buffer[..bytes_read]);
+            let _ = std::io::Write::write_all(
+                original_file.as_mut().expect("ERROR: Couldn't write file"),
+                &buffer[..bytes_read],
+            );
         }
     }
 
