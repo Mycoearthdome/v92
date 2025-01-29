@@ -759,12 +759,13 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
         if !state.file_name().is_empty() && state.file_size() > 0 {
             if resumed {
                 eprint!("Resuming ...");
+                state = ZState::new();
                 match receive(&mut zport, &mut io::sink(), &mut state) {
                     Ok(()) => {
                         state = ZState::new_file("resume.file", state.file_size() as u32).unwrap();
                         out_path = Path::new(output_dir).join(state.file_name());
                         bar.set_length(state.file_size().into());
-                        println!("{}/{}", output_dir, state.file_name());
+                        //println!("{}/{}", output_dir, state.file_name());
                     }
                     Err(e) => {
                         eprintln!("Error during initial receive: {:?}", e);
