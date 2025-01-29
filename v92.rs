@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read as StdRead, Write as StdWrite};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -328,14 +328,14 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
                             if let Err(e) = zmodem2_send(port.as_mut(), &path) {
                                 eprintln!("Serial Handler: ZMODEM2 send error: {}", e);
                             }
-                            //let _ = port.set_timeout(Duration::from_millis(500)); //TODO:Put back for chat after be responsive.
+                            let _ = port.set_timeout(Duration::from_millis(500));
                         }
                         SerialCommand::ReceiveZmodem(dest) => {
                             let _ = port.set_timeout(Duration::from_secs(20));
                             if let Err(e) = zmodem2_receive(port.as_mut(), &dest) {
                                 eprintln!("Serial Handler: ZMODEM2 receive error: {}", e);
                             }
-                            //let _ = port.set_timeout(Duration::from_millis(500));
+                            let _ = port.set_timeout(Duration::from_millis(500));
                         }
                         SerialCommand::Quit => {
                             //println!("Serial Handler: Quit command received.");
@@ -752,14 +752,20 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
     // Progress bar setup
     let mut bar = ProgressBar::new(0);
 
+    let mut out_path = PathBuf::new();
+
     loop {
         if !state.file_name().is_empty() && state.file_size() > 0 {
 
             if resumed {
-                eprintln!("Resuming ...");
+                eprint!("Resuming ...");
                 match receive(&mut zport, &mut io::sink(), &mut state) {
                     Ok(()) => {
                         state = ZState::new_file("resume.file", state.file_size() as u32).unwrap();
+                        out_path = Path::new(output_dir).join(state.file_name());
+                        bar.set_length(state.file_size().into());
+                        println!("{}/{}", output_dir, state.file_name());
+                        
                     }
                     Err(e) => {
                         eprintln!("Error during initial receive: {:?}", e);
@@ -770,10 +776,6 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
                 file = None;
             }
 
-            let out_path = Path::new(output_dir).join(state.file_name());
-            bar.set_length(state.file_size().into());
-            //bar.set_draw_target(indicatif::ProgressDrawTarget::stderr()); //make the bar visible.
-
 
             // Open the file for appending or create a new one
             if file.is_none() {
@@ -782,7 +784,7 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
                     file = Some(File::options().append(true).open(&out_path)?);
                     let _ = file.as_mut().unwrap().seek(state.count());
                 } else {
-                    println!("Receiving ...");
+                    println!("Receiving ...{}", state.file_name());
                     file = Some(File::create(&out_path)?);
                     if !resumed {
                         original_filename = out_path
@@ -833,12 +835,17 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
         } else {
             // Initial receive to fetch metadata (e.g., file name and size)
             match receive(&mut zport, &mut io::sink(), &mut state) {
-                Ok(()) => {}
+                Ok(()) => {
+                    out_path = Path::new(output_dir).join(state.file_name());
+                    bar.set_length(state.file_size().into());
+                    println!("{}/{}", output_dir, state.file_name());
+                }
                 Err(e) => {
                     eprintln!("Error during initial receive: {:?}", e);
                     std::thread::sleep(Duration::from_millis(500)); // Pause before retrying
                 }
             }
+            
         }
 
         // Short pause to avoid tight looping
