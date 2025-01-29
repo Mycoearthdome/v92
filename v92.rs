@@ -324,14 +324,14 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
                             }
                         }
                         SerialCommand::SendZmodem(path) => {
-                            let _ = port.set_timeout(Duration::from_secs(20));
+                            let _ = port.set_timeout(Duration::from_secs(30));
                             if let Err(e) = zmodem2_send(port.as_mut(), &path) {
                                 eprintln!("Serial Handler: ZMODEM2 send error: {}", e);
                             }
                             let _ = port.set_timeout(Duration::from_millis(500));
                         }
                         SerialCommand::ReceiveZmodem(dest) => {
-                            let _ = port.set_timeout(Duration::from_secs(20));
+                            let _ = port.set_timeout(Duration::from_secs(30));
                             if let Err(e) = zmodem2_receive(port.as_mut(), &dest) {
                                 eprintln!("Serial Handler: ZMODEM2 receive error: {}", e);
                             }
@@ -840,7 +840,7 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
                 Ok(()) => {
                     out_path = Path::new(output_dir).join(state.file_name());
                     bar.set_length(state.file_size().into());
-                    println!("{}/{}", output_dir, state.file_name());
+                    //println!("{}/{}", output_dir, state.file_name());
                 }
                 Err(e) => {
                     eprintln!("Error during initial receive: {:?}", e);
