@@ -324,7 +324,7 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
                             }
                         }
                         SerialCommand::SendZmodem(path) => {
-                            let _ = port.set_timeout(Duration::from_secs(30));
+                            let _ = port.set_timeout(Duration::from_secs(60));
                             if let Err(e) = zmodem2_send(port.as_mut(), &path) {
                                 eprintln!("Serial Handler: ZMODEM2 send error: {}", e);
                             }
