@@ -324,18 +324,18 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
                             }
                         }
                         SerialCommand::SendZmodem(path) => {
-                            let _ = port.set_timeout(Duration::from_secs(60));
+                            let _ = port.set_timeout(Duration::from_secs(30));
                             if let Err(e) = zmodem2_send(port.as_mut(), &path) {
                                 eprintln!("Serial Handler: ZMODEM2 send error: {}", e);
                             }
-                            let _ = port.set_timeout(Duration::from_millis(500));
+                            //let _ = port.set_timeout(Duration::from_millis(500));
                         }
                         SerialCommand::ReceiveZmodem(dest) => {
                             let _ = port.set_timeout(Duration::from_secs(30));
                             if let Err(e) = zmodem2_receive(port.as_mut(), &dest) {
                                 eprintln!("Serial Handler: ZMODEM2 receive error: {}", e);
                             }
-                            let _ = port.set_timeout(Duration::from_millis(500));
+                            //let _ = port.set_timeout(Duration::from_millis(500));
                         }
                         SerialCommand::Quit => {
                             //println!("Serial Handler: Quit command received.");
@@ -627,6 +627,8 @@ impl ZSeek for LocalFile {
 // --------------------------------------------------------------------
 
 pub fn zmodem2_send(port: &mut dyn SerialPort, file_path: &str) -> Result<(), Box<dyn Error>> {
+    let mut running = true;
+    let mut crashed = false;
     let path = Path::new(file_path);
     if !path.exists() || !path.is_file() {
         return Err(format!("Invalid file: {}", file_path).into());
@@ -641,90 +643,106 @@ pub fn zmodem2_send(port: &mut dyn SerialPort, file_path: &str) -> Result<(), Bo
     //let mut offsets = Vec::new();
 
     println!("Sending '{}' ({} bytes) via ZMODEM...", file_path, size);
-
-    loop {
-        let bar = ProgressBar::new(state.file_size().into());
-        bar.set_position(state.count().into());
-
-        // Call `send` and handle the result
-        match send(&mut zport, &mut file, &mut state) {
-            Ok(()) => {
-                // If `send` succeeds, check if the stage is `Done`
-                if state.stage() == ZStage::Done {
-                    println!("File '{}' sent successfully!", file_path);
-                    break; // Exit the loop when the transfer is complete
-                } else {
-                    bar.set_position(state.count().into());
-                }
-            }
-            Err(e) => {
-                let mut resumefile = File::create("resume.file")?;
-                // Handle transfer interruption and retry
-                eprintln!("Error during send: {:?}. Retrying...", e);
-                //let mut reader = BufReader::new(port.try_clone()?);
-                //let mut line = String::new();
-                let mut buffer = [0u8; 4];
-                loop {
-                    match zport.read(&mut buffer) {
-                        Ok(n) => {
-                            if n > 0 {
-                                let offset = u32::from_le_bytes(buffer);
-                                if offset >= state.count() && offset < state.file_size() {
-                                    eprintln!("OFFSET = {}", offset);
-                                    /*
-                                    offsets.push(offset);
-                                    if offsets.len() == 3 {
-                                        eprintln!("GOT 3");
-                                        let mut map: HashMap<u32, u8> = HashMap::new();
-                                        for offset in offsets.clone() {
-                                            *map.entry(offset).or_insert(0) += 1;
-                                        }
-                                        let best_choice = 0;
-                                        for (key, value) in map {
-                                            if value > best_choice {
-                                                offset = key;
-                                            }
-                                        }
-
-                                        eprintln!("PICKED OFFSET = {}", offset);
-                                        */
-                                    let _ = file.seek(offset);
-                                    // Buffer for reading bytes
-                                    let mut buffer = [0; 1024];
-
-                                    // Read and write loop
-                                    loop {
-                                        let bytes_read =
-                                            std::io::Read::read(&mut file, &mut buffer)?;
-                                        if bytes_read == 0 {
-                                            break;
-                                        }
-                                        let _ = std::io::Write::write_all(
-                                            &mut resumefile,
-                                            &buffer[..bytes_read],
-                                        );
+    let mut buffer = [0u8; 4];
+    let bar = ProgressBar::new(state.file_size().into());
+    while running {
+        match zport.read(&mut buffer) {
+            Ok(n) => {
+                if n > 0 {
+                    if n == u32::from_le_bytes(*b"ERRO") {
+                        crashed = true;
+                        eprintln!("ERROR: FAR-END crashed!..resuming.");
+                        continue;
+                    }
+                    if crashed {
+                        let mut resumefile = File::create("resume.file")?;
+                        let offset = u32::from_le_bytes(buffer);
+                        if offset >= state.count() && offset < state.file_size() {
+                            eprintln!("OFFSET = {}", offset);
+                            /*
+                            offsets.push(offset);
+                            if offsets.len() == 3 {
+                                eprintln!("GOT 3");
+                                let mut map: HashMap<u32, u8> = HashMap::new();
+                                for offset in offsets.clone() {
+                                    *map.entry(offset).or_insert(0) += 1;
+                                }
+                                let best_choice = 0;
+                                for (key, value) in map {
+                                    if value > best_choice {
+                                        offset = key;
                                     }
-                                    file = resumefile;
+                                }
 
-                                    // Get metadata of the file
-                                    let metadata = fs::metadata("resume.file")?;
+                                eprintln!("PICKED OFFSET = {}", offset);
+                                */
+                            let _ = file.seek(offset);
+                            // Buffer for reading bytes
+                            let mut buffer = [0; 1024];
 
-                                    // Get the file size
-                                    let file_size = metadata.len();
-
-                                    state =
-                                        ZState::new_file("resume.file", file_size as u32).unwrap();
-
+                            // Read and write loop
+                            loop {
+                                let bytes_read = std::io::Read::read(&mut file, &mut buffer)?;
+                                if bytes_read == 0 {
                                     break;
-                                    //}
+                                }
+                                let _ = std::io::Write::write_all(
+                                    &mut resumefile,
+                                    &buffer[..bytes_read],
+                                );
+                            }
+                            file = resumefile;
+
+                            // Get metadata of the file
+                            let metadata = fs::metadata("resume.file")?;
+
+                            // Get the file size
+                            let file_size = metadata.len();
+
+                            state = ZState::new_file("resume.file", file_size as u32).unwrap();
+                            
+                            let bar = ProgressBar::new(state.file_size().into());
+                            bar.set_position(state.count().into());
+
+                            loop {
+                                // Call `send` and handle the result
+                                match send(&mut zport, &mut file, &mut state) {
+                                    Ok(()) => {
+                                        // If `send` succeeds, check if the stage is `Done`
+                                        if state.stage() == ZStage::Done {
+                                            println!("File '{}' sent successfully!", file_path);
+                                            running = false; // Exit the loop when the transfer is complete
+                                            break;
+                                        } else {
+                                            bar.set_position(state.count().into());
+                                        }
+                                    }
+                                    Err(_e) => {
+                                        bar.abandon();
+                                        break;
+                                    }
                                 }
                             }
                         }
-                        Err(_e) => continue,
                     }
                 }
-                //std::thread::sleep(Duration::from_millis(500)); // Pause before retrying
-                continue;
+            }
+            Err(_e) => {
+                loop {
+                    // Call `send` and handle the result
+                    match send(&mut zport, &mut file, &mut state) {
+                        Ok(()) => {
+                            // If `send` succeeds, check if the stage is `Done`
+                            if state.stage() == ZStage::Done {
+                                println!("File '{}' sent successfully!", file_path);
+                                running = false; // Exit the loop when the transfer is complete
+                            } else {
+                                bar.set_position(state.count().into());
+                            }
+                        }
+                        Err(_e) => break,
+                    }
+                }
             }
         }
 
@@ -817,10 +835,10 @@ pub fn zmodem2_receive(port: &mut dyn SerialPort, output_dir: &str) -> Result<()
                     std::thread::sleep(Duration::from_millis(2000));
                     eprintln!("Sending progress={}", state.count().to_string());
 
-                    for _ in 0..10{
-                        let _ = zport.write_all(&state.count().to_le_bytes());
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
+                    let _ = zport.write_all(b"ERRO");
+                    let _ = zport.write_all(&state.count().to_le_bytes());
+
+                    std::thread::sleep(Duration::from_millis(50));
 
                     resumed = true;
                     bar.finish_and_clear();
