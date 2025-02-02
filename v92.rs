@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use rustyline::{Editor, error::ReadlineError, history::DefaultHistory};
 
 // Pull in zmodem2's symbols
 use zmodem2::{
@@ -37,8 +38,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!();
 
     let mut maybe_port: Option<Box<dyn SerialPort + Send>> = None;
-    let stdin = io::stdin();
 
+    let stdin = io::stdin();
+    
     loop {
         print!("> ");
         io::stdout().flush().ok();
@@ -291,6 +293,8 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
     let (cmd_sender, cmd_receiver): (Sender<SerialCommand>, Receiver<SerialCommand>) = unbounded();
     let (data_sender, data_receiver): (Sender<String>, Receiver<String>) = unbounded();
 
+    let mut recall = Editor::<(), DefaultHistory>::new().expect("Failed to create editor");
+
     // Atomic flag to indicate whether the application is running
     let running = Arc::new(AtomicBool::new(true));
 
@@ -437,8 +441,6 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
 
     // Spawn the writer thread to handle user input
     let writer_handle = thread::spawn(move || {
-        let stdin = io::stdin();
-        let mut stdin_lock = stdin.lock();
         let mut input = String::new();
 
         while running_clone_writer.load(Ordering::SeqCst) {
@@ -446,14 +448,10 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
             io::stdout().flush().expect("Failed to flush stdout");
 
             input.clear();
-            match stdin_lock.read_line(&mut input) {
-                Ok(n) => {
-                    if n == 0 {
-                        // EOF reached
-                        break;
-                    }
-
-                    let trimmed = input.trim_end().to_string();
+            match recall.readline(">> ") {
+                Ok(line) => {
+                    recall.add_history_entry(line.as_str()).unwrap();
+                    let trimmed = line.trim_end().to_string();
 
                     if trimmed.starts_with("/send ") {
                         let path = trimmed.strip_prefix("/send ").unwrap().trim().to_string();
@@ -480,9 +478,13 @@ fn chat_loop(port: Box<dyn SerialPort + Send>) {
                         }
                     }
                 }
-                Err(e) => {
-                    eprintln!("Writer thread: Error reading from stdin: {}", e);
+                
+                Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => {
+                    println!("Exiting...");
                     break;
+                }
+                Err(err) => {
+                    println!("Error: {:?}", err);
                 }
             }
         }
